@@ -1,0 +1,184 @@
+# Работа с JSON файлами и загрузка в PostgreSQL
+
+Вот как можно адаптировать ваш код для работы с JSON файлами вместо TSKV:
+
+## Основной подход для JSON
+
+```python
+import psycopg2
+import json
+
+# Подключение к PostgreSQL
+connection = psycopg2.connect(
+    user="univer",
+    password="univer",
+    host="localhost",
+    port="5432",
+    database='tskv'
+)
+cursor = connection.cursor()
+
+# Создание таблицы (аналогично вашему примеру)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS public.reviews (
+    address TEXT,
+    name_ru TEXT,
+    rating INTEGER,
+    rubrics TEXT,
+    text TEXT
+);
+""")
+connection.commit()
+
+# Чтение JSON файла
+with open('reviews.json', 'r', encoding='utf-8') as f:
+    # В зависимости от формата JSON:
+    # 1. Если файл содержит один JSON объект на строку
+    for line in f:
+        try:
+            data = json.loads(line)
+            
+            # Обработка данных (аналогично вашему примеру)
+            address = data.get('address', '')[:100]
+            name_ru = data.get('name_ru', '')[:100]
+            
+            # Обработка рейтинга
+            rating = data.get('rating', 0)
+            if isinstance(rating, str):
+                rating = rating.rstrip('.')  # Удаляем точку в конце, если есть
+                try:
+                    rating = int(rating)
+                except ValueError:
+                    rating = 0
+            
+            rubrics = data.get('rubrics', '')[:100]
+            text = data.get('text', '')[:1000]
+
+            # Вставка с использованием параметризованных запросов
+            cursor.execute(
+                "INSERT INTO public.reviews (address, name_ru, rating, rubrics, text) VALUES (%s, %s, %s, %s, %s)",
+                (address, name_ru, rating, rubrics, text)
+            )
+            
+        except json.JSONDecodeError as e:
+            print(f"Ошибка декодирования JSON: {e}")
+            continue
+
+connection.commit()
+connection.close()
+print("Загрузка завершена")
+```
+
+## Различные форматы JSON и их обработка
+
+### 1. JSON Lines (каждая строка - отдельный JSON)
+
+```python
+with open('data.jsonl', 'r') as f:
+    for line in f:
+        record = json.loads(line)
+        # обработка record
+```
+
+### 2. Один большой JSON массив
+
+```python
+with open('data.json', 'r') as f:
+    data = json.load(f)  # загружаем весь файл
+    for record in data:  # предполагается, что data - это список
+        # обработка record
+```
+
+### 3. Сложные вложенные структуры
+
+Если JSON содержит вложенные структуры, которые нужно "разворачивать":
+
+```python
+for record in data:
+    address = record.get('location', {}).get('address', '')
+    name_ru = record.get('names', {}).get('ru', '')
+    # и т.д.
+```
+
+## Советы по обработке JSON
+
+1. **Проверка данных**:
+   - Всегда используйте `.get()` с значением по умолчанию вместо прямого доступа по ключу
+   - Проверяйте типы данных перед вставкой
+
+2. **Оптимизация производительности**:
+   ```python
+   # Пакетная вставка
+   batch = []
+   for record in data:
+       batch.append((address, name_ru, rating, rubrics, text))
+       if len(batch) >= 1000:
+           cursor.executemany(INSERT_SQL, batch)
+           connection.commit()
+           batch = []
+   if batch:  # вставить оставшиеся записи
+       cursor.executemany(INSERT_SQL, batch)
+       connection.commit()
+   ```
+
+3. **Обработка ошибок**:
+   ```python
+   try:
+       # ваш код обработки
+   except psycopg2.Error as e:
+       connection.rollback()
+       print(f"Ошибка базы данных: {e}")
+   except Exception as e:
+       print(f"Общая ошибка: {e}")
+   ```
+
+4. **Использование контекстного менеджера**:
+   ```python
+   with psycopg2.connect(...) as conn:
+       with conn.cursor() as cursor:
+           # ваш код
+   ```
+
+## Пример с более сложной структурой JSON
+
+Если ваш JSON имеет сложную структуру, например:
+```json
+{
+    "place_id": "123",
+    "metadata": {
+        "address": "ул. Примерная, 1",
+        "names": {
+            "ru": "Примерное место",
+            "en": "Example place"
+        }
+    },
+    "reviews": [
+        {
+            "rating": 5,
+            "text": "Отличное место!",
+            "author": "user123"
+        }
+    ]
+}
+```
+
+Код для обработки:
+```python
+with open('complex_data.json', 'r') as f:
+    data = json.load(f)
+    
+    address = data.get('metadata', {}).get('address', '')[:100]
+    name_ru = data.get('metadata', {}).get('names', {}).get('ru', '')[:100]
+    
+    # Обработка отзывов (если их несколько)
+    for review in data.get('reviews', []):
+        rating = review.get('rating', 0)
+        text = review.get('text', '')[:1000]
+        
+        cursor.execute(
+            "INSERT INTO public.reviews VALUES (%s, %s, %s, %s, %s)",
+            (address, name_ru, rating, '', text)  # rubrics оставлен пустым
+        )
+```
+
+Выберите подход, который соответствует структуре вашего JSON файла.
