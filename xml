@@ -1,0 +1,282 @@
+Вот примеры кода для обработки каждого формата (TSKV, JSON, XML) с загрузкой в PostgreSQL, с комментариями и основными функциями:
+
+---
+
+### **1. Обработка TSKV (ваш исходный код с улучшениями)**
+```python
+import psycopg2
+
+def process_tskv_to_postgresql(tskv_file, db_params):
+    # Подключение к БД
+    conn = psycopg2.connect(**db_params)
+    cursor = conn.cursor()
+    
+    # Создание таблицы
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS public.reviews (
+        id SERIAL PRIMARY KEY,
+        address TEXT,
+        name_ru TEXT,
+        rating INTEGER,
+        rubrics TEXT,
+        review_text TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    conn.commit()
+
+    # Парсинг TSKV
+    with open(tskv_file, 'r', encoding='utf-8') as file:
+        batch = []
+        for line in file:
+            try:
+                fields = line.strip().split('\t')
+                data = {}
+                for field in fields:
+                    if '=' in field:
+                        key, value = field.split('=', 1)
+                        data[key] = value.replace("'", "''")  # Экранирование кавычек
+                
+                # Подготовка данных
+                address = data.get('address', '')[:100]
+                name_ru = data.get('name_ru', '')[:100]
+                rating = int(float(data.get('rating', '0').rstrip('.')))
+                rubrics = data.get('rubrics', '')[:100]
+                review_text = data.get('text', '')[:1000]
+
+                batch.append((address, name_ru, rating, rubrics, review_text))
+                
+                # Пакетная вставка (по 1000 записей)
+                if len(batch) >= 1000:
+                    cursor.executemany(
+                        "INSERT INTO public.reviews (address, name_ru, rating, rubrics, review_text) VALUES (%s, %s, %s, %s, %s)",
+                        batch
+                    )
+                    conn.commit()
+                    batch = []
+                    
+            except Exception as e:
+                print(f"Ошибка в строке: {line.strip()}. Ошибка: {e}")
+                continue
+
+        # Вставка оставшихся записей
+        if batch:
+            cursor.executemany(
+                "INSERT INTO public.reviews (address, name_ru, rating, rubrics, review_text) VALUES (%s, %s, %s, %s, %s)",
+                batch
+            )
+            conn.commit()
+
+    conn.close()
+    print("Загрузка TSKV завершена!")
+
+# Пример вызова
+db_params = {
+    'user': 'univer',
+    'password': 'univer',
+    'host': 'localhost',
+    'port': '5432',
+    'database': 'tskv'
+}
+process_tskv_to_postgresql('geo-reviews-dataset-2023.tskv', db_params)
+```
+
+---
+
+### **2. Обработка JSON**
+```python
+import psycopg2
+import json
+from datetime import datetime
+
+def process_json_to_postgresql(json_file, db_params):
+    conn = psycopg2.connect(**db_params)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS public.json_reviews (
+        id SERIAL PRIMARY KEY,
+        place_id TEXT,
+        address TEXT,
+        name_ru TEXT,
+        rating NUMERIC(3,1),
+        categories JSONB,
+        reviews JSONB[],
+        last_updated TIMESTAMP
+    );
+    """)
+    conn.commit()
+
+    with open(json_file, 'r', encoding='utf-8') as file:
+        if json_file.endswith('.jsonl'):
+            # Для JSON Lines (каждая строка - JSON)
+            data = [json.loads(line) for line in file]
+        else:
+            # Для обычного JSON
+            data = json.load(file)
+
+        batch = []
+        for item in data:
+            try:
+                # Пример сложной структуры JSON
+                place_id = item.get('id', '')
+                address = item.get('location', {}).get('address', '')[:200]
+                name_ru = item.get('names', {}).get('ru', '')[:100]
+                rating = float(item.get('rating', 0))
+                categories = json.dumps(item.get('categories', []))
+                
+                # Сбор всех отзывов в массив JSON
+                reviews = []
+                for review in item.get('reviews', []):
+                    reviews.append(json.dumps({
+                        'author': review.get('author'),
+                        'text': review.get('text'),
+                        'rating': review.get('rating')
+                    }))
+
+                batch.append((
+                    place_id, address, name_ru, rating, 
+                    categories, reviews, datetime.now()
+                ))
+
+                if len(batch) >= 500:
+                    cursor.executemany("""
+                        INSERT INTO public.json_reviews 
+                        (place_id, address, name_ru, rating, categories, reviews, last_updated)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, batch)
+                    conn.commit()
+                    batch = []
+
+            except Exception as e:
+                print(f"Ошибка в элементе {item.get('id')}: {e}")
+
+        if batch:
+            cursor.executemany("""
+                INSERT INTO public.json_reviews 
+                (place_id, address, name_ru, rating, categories, reviews, last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, batch)
+            conn.commit()
+
+    conn.close()
+    print("JSON данные загружены!")
+
+# Пример вызова
+process_json_to_postgresql('reviews.json', db_params)
+```
+
+---
+
+### **3. Обработка XML**
+```python
+import psycopg2
+from lxml import etree
+from io import StringIO
+
+def process_xml_to_postgresql(xml_file, db_params):
+    conn = psycopg2.connect(**db_params)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS public.xml_places (
+        id SERIAL PRIMARY KEY,
+        place_id TEXT,
+        address TEXT,
+        name_ru TEXT,
+        rating NUMERIC(3,1),
+        features TEXT[],
+        xml_data XML,
+        import_time TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    conn.commit()
+
+    # Парсинг XML (с обработкой больших файлов)
+    context = etree.iterparse(xml_file, events=('end',), tag='place')
+    
+    batch = []
+    for event, elem in context:
+        try:
+            place_id = elem.get('id', '')
+            address = elem.findtext('address', default='')[:200]
+            name_ru = elem.findtext('names/name[@lang="ru"]', default='')[:100]
+            rating = float(elem.findtext('rating', default='0'))
+            
+            # Сбор всех features в массив
+            features = [
+                feature.text for feature in elem.findall('features/feature') 
+                if feature.text
+            ]
+            
+            # Сохранение исходного XML элемента
+            xml_str = etree.tostring(elem, encoding='unicode')
+            
+            batch.append((
+                place_id, address, name_ru, rating, 
+                features, xml_str
+            ))
+
+            # Пакетная вставка
+            if len(batch) >= 200:
+                cursor.executemany("""
+                    INSERT INTO public.xml_places 
+                    (place_id, address, name_ru, rating, features, xml_data)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, batch)
+                conn.commit()
+                batch = []
+            
+            # Очистка памяти
+            elem.clear()
+            while elem.getprevious() is not None:
+                del elem.getparent()[0]
+                
+        except Exception as e:
+            print(f"Ошибка в элементе {elem.get('id')}: {e}")
+            continue
+
+    if batch:
+        cursor.executemany("""
+            INSERT INTO public.xml_places 
+            (place_id, address, name_ru, rating, features, xml_data)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, batch)
+        conn.commit()
+
+    conn.close()
+    print("XML данные успешно импортированы!")
+
+# Пример вызова
+process_xml_to_postgresql('places.xml', db_params)
+```
+
+---
+
+### **Ключевые особенности каждого модуля:**
+
+1. **TSKV**:
+   - Разбиение строк по табуляции
+   - Обработка формата `ключ=значение`
+   - Простая валидация данных
+
+2. **JSON**:
+   - Поддержка как обычного JSON, так и JSON Lines
+   - Работа с вложенными структурами
+   - Использование типа `JSONB` в PostgreSQL
+
+3. **XML**:
+   - Потоковая обработка через `iterparse` (экономя память)
+   - Использование XPath для поиска элементов
+   - Сохранение исходного XML в БД (тип `XML`)
+
+Все модули включают:
+- Пакетную вставку для производительности
+- Обработку ошибок
+- Подключение к PostgreSQL с параметрами
+- Логирование процесса
+
+Для работы может потребоваться установка:
+```
+pip install psycopg2-binary lxml
+```
